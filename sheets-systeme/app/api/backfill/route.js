@@ -6,7 +6,7 @@ import { upsertContact } from "../../../lib/systeme";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
-const BATCH = 25;
+const BATCH = 8;
 
 function toTime(v) {
   if (typeof v === "number") {
@@ -63,7 +63,6 @@ export async function POST(req) {
     } catch (e) {
       results.push({ status: "error: " + e.message, id: null });
     }
-    await new Promise((r) => setTimeout(r, 200));
   }
 
   const nextOffset = offset + slice.length < total ? offset + slice.length : null;
