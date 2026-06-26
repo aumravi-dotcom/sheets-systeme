@@ -1,19 +1,16 @@
 const API_BASE = "https://api.systeme.io/api";
 
 async function sysFetch(key, method, path, body, contentType) {
-  const opts = {
-    method,
-    headers: { "X-API-Key": key },
-  };
+  const opts = { method, headers: { "X-API-Key": key } };
   if (body != null) {
     opts.headers["Content-Type"] = contentType || "application/json";
     opts.body = JSON.stringify(body);
   }
-  for (let attempt = 0; attempt < 4; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     const res = await fetch(API_BASE + path, opts);
     if (res.status === 429) {
-      const wait = Number(res.headers.get("Retry-After") || 2);
-      await new Promise((r) => setTimeout(r, (wait + 1) * 1000));
+      const wait = Math.min(Number(res.headers.get("Retry-After") || 1), 3);
+      await new Promise((r) => setTimeout(r, (wait + 0.2) * 1000));
       continue;
     }
     let json = null;
@@ -43,7 +40,6 @@ async function getOrCreateTagId(key, name, cache) {
   const norm = String(name).trim();
   if (!norm) return null;
   if (cache && cache[norm] != null) return cache[norm];
-
   let res = await sysFetch(key, "GET", "/tags?limit=100");
   let items = res.json ? res.json.items || res.json.data || [] : [];
   for (const t of items) {
@@ -58,16 +54,15 @@ async function getOrCreateTagId(key, name, cache) {
   return id;
 }
 
-// Decide which tag names apply to a row, from the connection's tagRules.
 function tagsForRow(conn, rowObj) {
   const out = new Set();
   for (const rule of conn.tagRules || []) {
     const v = rule.header != null ? String(rowObj[rule.header] ?? "").trim() : "";
     let hit = false;
     switch (rule.type) {
-      case "always":   hit = true; break;
+      case "always": hit = true; break;
       case "nonempty": hit = v !== ""; break;
-      case "equals":   hit = v.toLowerCase() === String(rule.value || "").toLowerCase(); break;
+      case "equals": hit = v.toLowerCase() === String(rule.value || "").toLowerCase(); break;
       case "contains": hit = v.toLowerCase().includes(String(rule.value || "").toLowerCase()); break;
       default: hit = false;
     }
@@ -82,7 +77,7 @@ function dateStr(v) {
 }
 
 /**
- * Upsert one contact from a row object (header -> value), then apply tag rules.
+ * Upsert one contact (create-first to minimise API calls), then apply tag rules.
  * Returns { status, id }.
  */
 async function upsertContact(conn, rowObj, tagCache) {
@@ -100,7 +95,6 @@ async function upsertContact(conn, rowObj, tagCache) {
   put("firstName", col.firstName);
   put("lastName", col.lastName);
   put("phoneNumber", col.phoneNumber);
-
   for (const cf of conn.customFields || []) {
     const val = rowObj[cf.header];
     if (val !== "" && val != null) body.fields.push({ slug: cf.slug, value: String(val) });
@@ -110,10 +104,18 @@ async function upsertContact(conn, rowObj, tagCache) {
   }
   if (!body.fields.length) delete body.fields;
 
-  // Upsert by email.
-  let id = await findContactByEmail(key, email);
-  let label;
-  if (id) {
+  let id = null;
+  let label = "";
+
+  // CREATE FIRST — one call for brand-new contacts (the common backfill case).
+  const res = await sysFetch(key, "POST", "/contacts", body);
+  if (res.code >= 200 && res.code < 300 && res.json && res.json.id) {
+    id = res.json.id;
+    label = "ok (created)";
+  } else if (res.code === 409 || res.code === 422) {
+    // Already exists (or validation). Look it up.
+    id = await findContactByEmail(key, email);
+    if (!id) return { status: `skip: rejected ${res.code}`, id: null };
     if ((conn.onDuplicate || "update") === "skip") {
       label = "ok (existed, skipped)";
     } else {
@@ -125,20 +127,9 @@ async function upsertContact(conn, rowObj, tagCache) {
       label = "ok (updated)";
     }
   } else {
-    const res = await sysFetch(key, "POST", "/contacts", body);
-    if (res.code >= 200 && res.code < 300 && res.json && res.json.id) {
-      id = res.json.id;
-      label = "ok (created)";
-    } else if (res.code === 422) {
-      id = await findContactByEmail(key, email);
-      if (!id) return { status: "skip: rejected 422", id: null };
-      label = "ok (existed)";
-    } else {
-      return { status: `error ${res.code}`, id: null };
-    }
+    return { status: `error ${res.code}`, id: null };
   }
 
-  // Tags.
   for (const tagName of tagsForRow(conn, rowObj)) {
     const tagId = await getOrCreateTagId(key, tagName, tagCache);
     if (tagId != null) await sysFetch(key, "POST", `/contacts/${id}/tags`, { tagId: Number(tagId) });
