@@ -24,6 +24,11 @@ async function sysFetch(key, method, path, body, contentType) {
 function looksLikeEmail(e) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(e || "").trim());
 }
+function t255(v) { return String(v).slice(0, 255); }
+function short(res) {
+  const s = res.json ? JSON.stringify(res.json) : String(res.text || "");
+  return s.slice(0, 160);
+}
 
 async function findContactByEmail(key, email) {
   const res = await sysFetch(key, "GET", "/contacts?email=" + encodeURIComponent(email));
@@ -77,57 +82,76 @@ function dateStr(v) {
 }
 
 /**
- * Upsert one contact (create-first to minimise API calls), then apply tag rules.
+ * Upsert one contact. systeme.io wants names as fields with slugs
+ * (first_name / surname / phone_number). Custom fields are best-effort:
+ * if one is invalid, the contact is still created with the valid fields.
  * Returns { status, id }.
  */
 async function upsertContact(conn, rowObj, tagCache) {
   const key = conn.systemeKey;
   const col = conn.columns || {};
+  const locale = conn.locale || "en";
   const email = String(rowObj[col.email] ?? "").trim();
   if (!looksLikeEmail(email)) return { status: "skip: bad email", id: null };
 
-  const body = { email, locale: conn.locale || "en", fields: [] };
-  const put = (k, header) => {
+  // Standard fields (always-valid slugs).
+  const standard = [];
+  const pushStd = (slug, header) => {
     if (!header) return;
     const val = rowObj[header];
-    if (val !== "" && val != null) body[k] = String(val).trim();
+    if (val !== "" && val != null) standard.push({ slug, value: t255(val) });
   };
-  put("firstName", col.firstName);
-  put("lastName", col.lastName);
-  put("phoneNumber", col.phoneNumber);
+  pushStd("first_name", col.firstName);
+  pushStd("surname", col.lastName);
+  pushStd("phone_number", col.phoneNumber);
+
+  // Custom fields (may not exist in the account → best-effort).
+  const custom = [];
   for (const cf of conn.customFields || []) {
     const val = rowObj[cf.header];
-    if (val !== "" && val != null) body.fields.push({ slug: cf.slug, value: String(val) });
+    if (val !== "" && val != null && cf.slug) custom.push({ slug: cf.slug, value: t255(val) });
   }
   if (conn.originalDateSlug && conn.dateColumn && rowObj[conn.dateColumn]) {
-    body.fields.push({ slug: conn.originalDateSlug, value: dateStr(rowObj[conn.dateColumn]) });
+    custom.push({ slug: conn.originalDateSlug, value: t255(dateStr(rowObj[conn.dateColumn])) });
   }
-  if (!body.fields.length) delete body.fields;
+  const allFields = standard.concat(custom);
+  const makeBody = (fields) => (fields.length ? { email, locale, fields } : { email, locale });
 
   let id = null;
   let label = "";
 
-  // CREATE FIRST — one call for brand-new contacts (the common backfill case).
-  const res = await sysFetch(key, "POST", "/contacts", body);
+  // Attempt 1: create with everything.
+  let res = await sysFetch(key, "POST", "/contacts", makeBody(allFields));
   if (res.code >= 200 && res.code < 300 && res.json && res.json.id) {
     id = res.json.id;
     label = "ok (created)";
   } else if (res.code === 409 || res.code === 422) {
-    // Already exists (or validation). Look it up.
+    // Already exists?
     id = await findContactByEmail(key, email);
-    if (!id) return { status: `skip: rejected ${res.code}`, id: null };
-    if ((conn.onDuplicate || "update") === "skip") {
-      label = "ok (existed, skipped)";
+    if (id) {
+      if ((conn.onDuplicate || "update") === "skip") {
+        label = "ok (existed, skipped)";
+      } else {
+        let p = await sysFetch(key, "PATCH", "/contacts/" + id, { locale, fields: allFields }, "application/merge-patch+json");
+        if (p.code >= 300 && custom.length) {
+          await sysFetch(key, "PATCH", "/contacts/" + id, { locale, fields: standard }, "application/merge-patch+json");
+          label = "ok (updated, custom skipped)";
+        } else {
+          label = "ok (updated)";
+        }
+      }
     } else {
-      const patch = { locale: body.locale, fields: (body.fields || []).slice() };
-      if (body.firstName) patch.fields.push({ slug: "first_name", value: body.firstName });
-      if (body.lastName) patch.fields.push({ slug: "surname", value: body.lastName });
-      if (body.phoneNumber) patch.fields.push({ slug: "phone_number", value: body.phoneNumber });
-      await sysFetch(key, "PATCH", "/contacts/" + id, patch, "application/merge-patch+json");
-      label = "ok (updated)";
+      // Not a duplicate → a custom field is the problem. Retry without customs.
+      let res2 = await sysFetch(key, "POST", "/contacts", makeBody(standard));
+      if (res2.code >= 200 && res2.code < 300 && res2.json && res2.json.id) {
+        id = res2.json.id;
+        label = "ok (created, custom skipped)";
+      } else {
+        return { status: `error ${res2.code}: ${short(res2)}`, id: null };
+      }
     }
   } else {
-    return { status: `error ${res.code}`, id: null };
+    return { status: `error ${res.code}: ${short(res)}`, id: null };
   }
 
   for (const tagName of tagsForRow(conn, rowObj)) {
